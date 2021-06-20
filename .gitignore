@@ -1,0 +1,5 @@
+*.log
+.bsp/
+.idea/
+target/
+NOTES
