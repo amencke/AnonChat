@@ -90,7 +90,7 @@ class ConversationRoutes(sessionHandler: ActorRef[SessionHandlerCommand])(implic
                   onComplete(maybeConversationState) {
                     case Success(
                           ConversationHistory(
-                            data: scala.collection.mutable.Map[ConversationID, List[
+                            data: scala.collection.immutable.Map[ConversationID, List[
                               (UserID, String)
                             ]]
                           )

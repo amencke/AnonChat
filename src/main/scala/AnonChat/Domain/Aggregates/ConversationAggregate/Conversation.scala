@@ -105,8 +105,8 @@ object SessionHandler {
 }
 
 object ConversationBehavior {
-  // This naming is wrong. This object is really a session, since the API requests access to this behaviours
-  // and this is what is granted by what is currently called "Session"
+  // This naming is wrong. This object is really a session, since the REST API needs access to the behaviours
+  // in this class, and an instance of class is what is granted by what is currently called "SessionHandler"
   def apply(
       conversationID: ConversationID,
       sessionHandler: ActorRef[SessionHandlerCommand],
@@ -169,15 +169,16 @@ private class ConversationBehavior(
           persistentEventSourcedActor.ask(GetHistory(conversationID, requester, _))
         maybeHistory.onComplete {
           case Success(conversationHistory) =>
+            // when `ask` is used, this isn't an actor. Hence the error "Unsupported access to ActorContext operation from the outside of Actor"
             //context.log.info(s"********** SUCCESS **************")
             replyTo ! conversationHistory
           case Failure(_) =>
-            context.log.info(s"********** FAILURE **************")
+            //context.log.info(s"********** FAILURE **************")
             replyTo ! ConversationHistory(Map.empty[ConversationID, List[(UserID, String)]])
           case _ =>
-            context.log.info(s"********** SKIPPED **************")
+          //context.log.info(s"********** SKIPPED **************")
         }
-        Await.ready(maybeHistory, Duration.Inf)
+        Await.ready(maybeHistory, 3.seconds)
         idle()
 
       case NotifyClient(message) =>
