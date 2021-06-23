@@ -1,88 +1,99 @@
 package com.aqualung.anonchat
 package AnonChat.Domain.Aggregates.ConversationAggregate
 
-import AnonChat.Domain.Aggregates.ConversationAggregate.Session._
+import AnonChat.Domain.Aggregates.ConversationAggregate.SessionHandler._
 import AnonChat.Domain.Entities._
 
+import akka.actor.typed.scaladsl.AskPattern.{Askable, schedulerFromActorSystem}
 import akka.actor.typed.scaladsl.TimerScheduler
 import akka.actor.typed.scaladsl.{AbstractBehavior, ActorContext, Behaviors}
 import akka.actor.typed.{ActorRef, Behavior}
+import akka.util.Timeout
+import AnonChat.Domain.Aggregates.ConversationAggregate.PersistentEventSourcedBehavior.ConversationHistory
+import AnonChat.Server.system
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.TimeUnit
-import scala.concurrent.duration.{DurationLong, FiniteDuration}
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration.{Duration, DurationLong, FiniteDuration}
+import scala.util.{Failure, Success}
 
-object Session {
+object SessionHandler {
 
-  sealed trait SessionCommand
+  sealed trait SessionHandlerCommand
 
   final case class GetSession(
       conversationID: ConversationID,
       requester: UserID,
       replyTo: ActorRef[SessionEvent]
-  ) extends SessionCommand
+  ) extends SessionHandlerCommand
 
-  final case class SessionTimeout(conversationID: ConversationID) extends SessionCommand
+  final case class SessionTimeout(conversationID: ConversationID) extends SessionHandlerCommand
 
-//  final case class EndConversation(withUser: UserID, replyTo: ActorRef[SessionEvent])
-//      extends AdminCommand
-//
-//  final case class GetMessagesSince(messageID: MessageID, replyTo: ActorRef[SessionEvent])
-//      extends AdminCommand
-
-  private[Aggregates] final case class PublishSessionMessage(userID: UserID, message: String)
-      extends SessionCommand
+  private[Aggregates] final case class PublishSessionMessage(
+      conversationID: ConversationID,
+      sender: UserID,
+      message: String
+  ) extends SessionHandlerCommand
 
   sealed trait SessionEvent
 
-  final case class SessionGranted(sessionHandle: ActorRef[PostMessage]) extends SessionEvent
+  final case class SessionGranted(sessionHandle: ActorRef[SessionCommand]) extends SessionEvent
 
-  final case class MessagePosted(byUser: UserID, message: String) extends SessionEvent
+  final case class MessagePosted(conversationID: ConversationID, sender: UserID, message: String)
+      extends SessionEvent
 
-  sealed trait ConversationCommand
+  sealed trait SessionCommand
 
-  final case class PostMessage(fromUserID: UserID, message: String) extends ConversationCommand
+  final case class PostMessage(conversationID: ConversationID, sender: UserID, message: String)
+      extends SessionCommand
 
-  private[Aggregates] final case class NotifyClient(message: MessagePosted)
-      extends ConversationCommand
+  final case class GetHistory(
+      conversationID: ConversationID,
+      requester: UserID,
+      replyTo: ActorRef[ConversationHistory]
+  ) extends SessionCommand
 
-  final case object ConversationTimeout extends ConversationCommand
+  private[Aggregates] final case class NotifyClient(message: MessagePosted) extends SessionCommand
 
-  def apply(): Behavior[SessionCommand] =
+  final case object ConversationTimeout extends SessionCommand
+
+  def apply(): Behavior[SessionHandlerCommand] =
     Behaviors.setup { context =>
-      Behaviors.withTimers { timers =>
-        new AdminBehavior(context, timers)
-      }
+      new SessionHandlerBehavior(context)
     }
 
-  class AdminBehavior(context: ActorContext[SessionCommand], timers: TimerScheduler[SessionCommand])
-      extends AbstractBehavior[SessionCommand](context) {
+  class SessionHandlerBehavior(
+      context: ActorContext[SessionHandlerCommand]
+  ) extends AbstractBehavior[SessionHandlerCommand](context) {
 
     private val sessions =
-      scala.collection.mutable.Map[ConversationID, ActorRef[ConversationCommand]]()
+      scala.collection.mutable.Map[ConversationID, ActorRef[SessionCommand]]()
 
-    override def onMessage(msg: SessionCommand): Behavior[SessionCommand] = {
+    override def onMessage(msg: SessionHandlerCommand): Behavior[SessionHandlerCommand] = {
       msg match {
         case GetSession(conversationID, requester, replyTo) =>
           val session = sessions.getOrElseUpdate(
             conversationID,
             context.spawn(
               ConversationBehavior(conversationID, context.self, replyTo),
-              name = URLEncoder.encode(conversationID.toString(), StandardCharsets.UTF_8.name)
+              name = URLEncoder.encode(
+                s"conversation-session-${conversationID.toString()}",
+                StandardCharsets.UTF_8.name
+              )
             )
           )
           replyTo ! SessionGranted(session)
-          context.log.info(s"Granted ${requester} a session.")
+          context.log.info(s"Granted user ${requester} a session.")
           sessions += (conversationID -> session)
           this
-        case PublishSessionMessage(userID, message) =>
-          context.log.info(s"Publishing message from ${userID}: ${message}")
-          val notification = NotifyClient(MessagePosted(userID, message))
-          sessions.filter { _._1 != userID } foreach { tup =>
-            tup._2 ! notification
-            println(s"Notified ${tup._1}: ${message}")
-          }
+        case PublishSessionMessage(conversationID, sender, message) =>
+          context.log.info(
+            s"Publishing to conversation ${conversationID}:\n" +
+              s"User ${sender} posted message: ${message}"
+          )
+          val notification = NotifyClient(MessagePosted(conversationID, sender, message))
+          sessions(conversationID) ! notification
           this
         case SessionTimeout(conversationID) =>
           sessions -= conversationID
@@ -94,30 +105,35 @@ object Session {
 }
 
 object ConversationBehavior {
+  // This naming is wrong. This object is really a session, since the API requests access to this behaviours
+  // and this is what is granted by what is currently called "Session"
   def apply(
       conversationID: ConversationID,
-      session: ActorRef[SessionCommand],
+      sessionHandler: ActorRef[SessionHandlerCommand],
       client: ActorRef[SessionEvent]
-  ): Behavior[ConversationCommand] =
+  ): Behavior[SessionCommand] =
     Behaviors.setup { context =>
       Behaviors.withTimers { timers =>
-        new ConversationBehavior(conversationID, timers, context, session, client)
+        new ConversationBehavior(conversationID, timers, context, sessionHandler, client)
       }
     }
 }
 
 private class ConversationBehavior(
     conversationID: ConversationID,
-    timers: TimerScheduler[ConversationCommand],
-    context: ActorContext[ConversationCommand],
-    conversation: ActorRef[SessionCommand],
+    timers: TimerScheduler[SessionCommand],
+    context: ActorContext[SessionCommand],
+    session: ActorRef[SessionHandlerCommand],
     client: ActorRef[SessionEvent]
-) extends AbstractBehavior[ConversationCommand](context) {
+) extends AbstractBehavior[SessionCommand](context) {
 
-  private val sessionTimeout: FiniteDuration =
-    context.system.settings.config
-      .getDuration("conversation.session.timeout", TimeUnit.MILLISECONDS)
-      .millis
+//  private val sessionTimeout: FiniteDuration =
+//    context.system.settings.config
+//      .getDuration("conversation.session.timeout", TimeUnit.MILLISECONDS)
+//      .millis
+  implicit val executionContext              = system.executionContext
+  private implicit val timeout: Timeout      = 3.seconds
+  private val sessionTimeout: FiniteDuration = 300.seconds
 
   private case object TimerKey
   private def idle(): ConversationBehavior = {
@@ -125,17 +141,56 @@ private class ConversationBehavior(
     this
   }
 
-  override def onMessage(msg: ConversationCommand): Behavior[ConversationCommand] =
+  /*
+  The point of using persistence with event sourcing here is that conversation history is cached, and
+  therefore we wouldn't need to make expensive database calls and replay all conversation events each
+  time a request is handled. That is still required when the first request comes in, but after that,
+  everything we need to service subsequent requests is available in memory. So each `ConversationBehavior`
+  actor has it's own `PersistentEventSourcedBehavior`, and the lifetime of both is controlled by
+  configuration provided for the parent (ConversationBehavior) actor.
+   */
+  val persistentEventSourcedActor = context.spawn(
+    PersistentEventSourcedBehavior(conversationID),
+    s"event-sourced-actor-${conversationID}"
+  )
+
+  override def onMessage(msg: SessionCommand): Behavior[SessionCommand] =
     msg match {
-      case PostMessage(fromUserID, message) =>
-        context.log.info(s"${fromUserID} posted: ${message}")
-        conversation ! PublishSessionMessage(fromUserID, message)
+      case PostMessage(conversationID, sender, message) =>
+        context.log.info(s"${sender} posted to conversation ${conversationID}: ${message}")
+        persistentEventSourcedActor ! PostMessage(conversationID, sender, message)
+        // session ! PublishSessionMessage(conversationID, sender, message)
+        // The event sourced actor should publish a message that gets consumed by an event publisher.
+        // That would guarantee that we only update clients AFTER we have persisted state
         idle()
+      case GetHistory(conversationID, requester, replyTo) =>
+        context.log.info(s"Retrieving history of conversation ${conversationID} for ${requester}")
+        val maybeHistory: Future[ConversationHistory] =
+          persistentEventSourcedActor.ask(GetHistory(conversationID, requester, _))
+        maybeHistory.onComplete {
+          case Success(conversationHistory) =>
+            //context.log.info(s"********** SUCCESS **************")
+            replyTo ! conversationHistory
+          case Failure(_) =>
+            context.log.info(s"********** FAILURE **************")
+            replyTo ! ConversationHistory(Map.empty[ConversationID, List[(UserID, String)]])
+          case _ =>
+            context.log.info(s"********** SKIPPED **************")
+        }
+        Await.ready(maybeHistory, Duration.Inf)
+        idle()
+
       case NotifyClient(message) =>
+        context.log.info(
+          s"Conversation actor received message for conversation ${message.conversationID}, notifying participants"
+        )
+        // There is no client, because the client is a non-actor requesting via an `ask`,
+        // so this message goes to dead letters
         client ! message
         idle()
       case ConversationTimeout =>
-        conversation ! SessionTimeout(conversationID)
+        session ! SessionTimeout(conversationID)
+        // This will also stop the event sourced actor
         Behaviors.stopped
     }
 }
