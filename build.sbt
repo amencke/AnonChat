@@ -21,7 +21,3 @@ libraryDependencies ++= Seq(
 
 libraryDependencies += "ch.qos.logback"            % "logback-classic" % "1.2.3"
 libraryDependencies += "org.fusesource.leveldbjni" % "leveldbjni-all"  % "1.8"
-
-//assemblyMergeStrategy in assembly := {
-//  case PathList("application.conf") => MergeStrategy.concat
-//}

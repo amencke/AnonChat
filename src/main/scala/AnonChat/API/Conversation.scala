@@ -10,8 +10,12 @@ import akka.util.Timeout
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
 import AnonChat.Domain.Aggregates.ConversationAggregate.SessionHandler._
-import AnonChat.Domain.Aggregates.ConversationAggregate.PersistentEventSourcedBehavior.ConversationHistory
+import AnonChat.Domain.Aggregates.ConversationAggregate.PersistentEventSourcedBehavior.{
+  ConversationCleared,
+  ConversationHistory
+}
 import AnonChat.Domain.Entities.{ConversationID, UserID}
+import AnonChat.Domain.Aggregates.ConversationAggregate.ConversationBehavior._
 
 import spray.json.DefaultJsonProtocol
 
@@ -25,13 +29,15 @@ case class PostMessageResponse(message: String)                extends Conversat
 case class PostMessageError(message: String)                   extends ConversationRestEntities
 case class GetHistoryRequest(requester: UserID)                extends ConversationRestEntities
 case class GetHistoryResponse(history: List[(UserID, String)]) extends ConversationRestEntities
+case class DeleteConversationRequest(requester: UserID)        extends ConversationRestEntities
 
 trait JsonSupport extends SprayJsonSupport with DefaultJsonProtocol {
-  implicit val postMessageRequestFormat       = jsonFormat2(PostMessageRequest)
-  implicit val postMessageResponseFormat      = jsonFormat1(PostMessageResponse)
-  implicit val postMessageErrorResponseFormat = jsonFormat1(PostMessageError)
-  implicit val getHistoryRequestFormat        = jsonFormat1(GetHistoryRequest)
-  implicit val getHistoryResponseFormat       = jsonFormat1(GetHistoryResponse)
+  implicit val postMessageRequestFormat        = jsonFormat2(PostMessageRequest)
+  implicit val postMessageResponseFormat       = jsonFormat1(PostMessageResponse)
+  implicit val postMessageErrorResponseFormat  = jsonFormat1(PostMessageError)
+  implicit val getHistoryRequestFormat         = jsonFormat1(GetHistoryRequest)
+  implicit val getHistoryResponseFormat        = jsonFormat1(GetHistoryResponse)
+  implicit val deleteConversationRequestFormat = jsonFormat1(DeleteConversationRequest)
 }
 
 class ConversationRoutes(sessionHandler: ActorRef[SessionHandlerCommand])(implicit
@@ -50,9 +56,14 @@ class ConversationRoutes(sessionHandler: ActorRef[SessionHandlerCommand])(implic
     session ! PostMessage(conversationID, sender, message)
 
   def getHistory(conversationID: ConversationID, requester: UserID)(
-      session: ActorRef[GetHistory]
+      session: ActorRef[SessionCommand]
   ): Future[ConversationHistory] =
     session.ask(GetHistory(conversationID, requester, _))
+
+  def deleteConversation(conversationID: ConversationID)(
+      session: ActorRef[SessionCommand]
+  ): Future[ConversationCleared] =
+    session.askWithStatus(DeleteConversation(conversationID, _))
 
   val version = "v1"
 
@@ -104,6 +115,29 @@ class ConversationRoutes(sessionHandler: ActorRef[SessionHandlerCommand])(implic
                 case Failure(ex) =>
                   complete(InternalServerError -> ex)
                 case _ => complete(InternalServerError, "An unknown error occurred")
+              }
+          }
+        }
+      },
+      pathPrefix(version / "conversation" / LongNumber) { conversationID =>
+        delete {
+          entity(as[DeleteConversationRequest]) {
+            dcr =>
+              val maybeSessionGranted: Future[SessionEvent] =
+                getSession(conversationID, dcr.requester)
+
+              onComplete(maybeSessionGranted) {
+                case Success(SessionGranted(session)) =>
+                  val maybeConversationDeleted = deleteConversation(conversationID)(session)
+                  onComplete(maybeConversationDeleted) {
+                    case Success(_) => complete(OK)
+                    case Failure(_) =>
+                      complete(
+                        InternalServerError,
+                        s"Failed to delete history for conversation ${conversationID}"
+                      )
+                  }
+                case _ => complete(BadRequest, "Request rejected") // session denied
               }
           }
         }

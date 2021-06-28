@@ -4,16 +4,13 @@ package AnonChat.Domain.Aggregates.ConversationAggregate
 import akka.actor.typed.Behavior
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.persistence.typed.PersistenceId
-import AnonChat.Domain.Aggregates.ConversationAggregate.SessionHandler.{
-  GetHistory,
-  MessagePosted,
-  PostMessage,
-  SessionCommand,
-  SessionEvent
-}
+import AnonChat.Domain.Aggregates.ConversationAggregate.SessionHandler._
 import AnonChat.Domain.Entities.{ConversationID, UserID}
 
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import AnonChat.Domain.Aggregates.ConversationAggregate.ConversationBehavior._
+
+import akka.pattern.StatusReply
 
 import scala.collection.{immutable, mutable}
 
@@ -36,6 +33,8 @@ object PersistentEventSourcedBehavior {
       data: immutable.Map[ConversationID, List[(UserID, String)]]
   )
 
+  case class ConversationCleared()
+
   val commandHandler: (
       ConversationInMemoryState,
       SessionCommand,
@@ -45,6 +44,9 @@ object PersistentEventSourcedBehavior {
       case PostMessage(conversationID, sender, message) =>
         context.log.info(
           s"Received a command: PostMessage(conversationID=${conversationID}, sender=${sender}, message=${message})"
+        )
+        context.log.info(
+          s"Publishing domain event: MessagePosted(conversationID=${conversationID}, sender=${sender}, message=${message})"
         )
         Effect.persist(MessagePosted(conversationID, sender, message))
       case GetHistory(conversationID, requester, replyTo) =>
@@ -59,6 +61,15 @@ object PersistentEventSourcedBehavior {
         )
         replyTo ! ConversationHistory(conversationHistory)
         Effect.none
+      case DeleteConversation(conversationID, replyTo) =>
+        context.log.info(
+          s"Received a command: DeleteConversation(conversationID=${conversationID}))"
+        )
+        replyTo ! StatusReply.Success(ConversationCleared())
+        context.log.info(
+          s"Publishing domain event: ConversationDeleted(conversationID=${conversationID})"
+        )
+        Effect.persist(ConversationDeleted(conversationID))
       case _ => throw new IllegalStateException()
     }
   }
@@ -70,14 +81,11 @@ object PersistentEventSourcedBehavior {
   ) => ConversationInMemoryState = { (state, event, context) =>
     event match {
       case MessagePosted(conversationID, sender, message) =>
-        context.log.info(
-          s"Publishing domain event: MessagePosted(${conversationID}, ${sender}, ${message})"
-        )
         val _ = state.data.getOrElseUpdate(conversationID, List[(UserID, String)]())
         state.data(conversationID) = List((sender, message)) ++ state.data(conversationID)
-        context.log.info(
-          s"Current state: ${state}"
-        )
+        state
+      case ConversationDeleted(conversationID) =>
+        state.data(conversationID) = List[(UserID, String)]()
         state
       case _ => throw new IllegalStateException()
     }

@@ -3,19 +3,26 @@ package AnonChat.Domain.Aggregates.ConversationAggregate
 
 import AnonChat.Domain.Aggregates.ConversationAggregate.SessionHandler._
 import AnonChat.Domain.Entities._
+import AnonChat.Domain.Aggregates.ConversationAggregate.PersistentEventSourcedBehavior.{
+  ConversationCleared,
+  ConversationHistory
+}
+import AnonChat.Server.system
 
 import akka.actor.typed.scaladsl.AskPattern.{Askable, schedulerFromActorSystem}
 import akka.actor.typed.scaladsl.TimerScheduler
 import akka.actor.typed.scaladsl.{AbstractBehavior, ActorContext, Behaviors}
 import akka.actor.typed.{ActorRef, Behavior}
 import akka.util.Timeout
-import AnonChat.Domain.Aggregates.ConversationAggregate.PersistentEventSourcedBehavior.ConversationHistory
-import AnonChat.Server.system
+import AnonChat.Domain.Aggregates.ConversationAggregate.ConversationBehavior._
+
+import akka.pattern.StatusReply
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
 import scala.concurrent.{Await, Future}
-import scala.concurrent.duration.{Duration, DurationLong, FiniteDuration}
+import scala.concurrent.duration.{DurationLong, FiniteDuration}
 import scala.util.{Failure, Success}
 
 object SessionHandler {
@@ -43,16 +50,7 @@ object SessionHandler {
   final case class MessagePosted(conversationID: ConversationID, sender: UserID, message: String)
       extends SessionEvent
 
-  sealed trait SessionCommand
-
-  final case class PostMessage(conversationID: ConversationID, sender: UserID, message: String)
-      extends SessionCommand
-
-  final case class GetHistory(
-      conversationID: ConversationID,
-      requester: UserID,
-      replyTo: ActorRef[ConversationHistory]
-  ) extends SessionCommand
+  final case class ConversationDeleted(conversationID: ConversationID) extends SessionEvent
 
   private[Aggregates] final case class NotifyClient(message: MessagePosted) extends SessionCommand
 
@@ -107,6 +105,23 @@ object SessionHandler {
 object ConversationBehavior {
   // This naming is wrong. This object is really a session, since the REST API needs access to the behaviours
   // in this class, and an instance of class is what is granted by what is currently called "SessionHandler"
+
+  sealed trait SessionCommand
+
+  final case class PostMessage(conversationID: ConversationID, sender: UserID, message: String)
+      extends SessionCommand
+
+  final case class GetHistory(
+      conversationID: ConversationID,
+      requester: UserID,
+      replyTo: ActorRef[ConversationHistory]
+  ) extends SessionCommand
+
+  final case class DeleteConversation(
+      conversationID: ConversationID,
+      replyTo: ActorRef[StatusReply[ConversationCleared]]
+  ) extends SessionCommand
+
   def apply(
       conversationID: ConversationID,
       sessionHandler: ActorRef[SessionHandlerCommand],
@@ -123,17 +138,18 @@ private class ConversationBehavior(
     conversationID: ConversationID,
     timers: TimerScheduler[SessionCommand],
     context: ActorContext[SessionCommand],
-    session: ActorRef[SessionHandlerCommand],
+    sessionHandler: ActorRef[SessionHandlerCommand],
     client: ActorRef[SessionEvent]
 ) extends AbstractBehavior[SessionCommand](context) {
 
-//  private val sessionTimeout: FiniteDuration =
-//    context.system.settings.config
-//      .getDuration("conversation.session.timeout", TimeUnit.MILLISECONDS)
-//      .millis
+  private val sessionTimeout: FiniteDuration =
+    context.system.settings.config
+      .getDuration("conversation.session.timeout", TimeUnit.MILLISECONDS)
+      .millis
+  private val requestTimeout: FiniteDuration = 3.seconds
   implicit val executionContext              = system.executionContext
   private implicit val timeout: Timeout      = 3.seconds
-  private val sessionTimeout: FiniteDuration = 300.seconds
+  //private val sessionTimeout: FiniteDuration = 300.seconds
 
   private case object TimerKey
   private def idle(): ConversationBehavior = {
@@ -159,9 +175,6 @@ private class ConversationBehavior(
       case PostMessage(conversationID, sender, message) =>
         context.log.info(s"${sender} posted to conversation ${conversationID}: ${message}")
         persistentEventSourcedActor ! PostMessage(conversationID, sender, message)
-        // session ! PublishSessionMessage(conversationID, sender, message)
-        // The event sourced actor should publish a message that gets consumed by an event publisher.
-        // That would guarantee that we only update clients AFTER we have persisted state
         idle()
       case GetHistory(conversationID, requester, replyTo) =>
         context.log.info(s"Retrieving history of conversation ${conversationID} for ${requester}")
@@ -169,16 +182,22 @@ private class ConversationBehavior(
           persistentEventSourcedActor.ask(GetHistory(conversationID, requester, _))
         maybeHistory.onComplete {
           case Success(conversationHistory) =>
-            // when `ask` is used, this isn't an actor. Hence the error "Unsupported access to ActorContext operation from the outside of Actor"
-            //context.log.info(s"********** SUCCESS **************")
             replyTo ! conversationHistory
           case Failure(_) =>
-            //context.log.info(s"********** FAILURE **************")
             replyTo ! ConversationHistory(Map.empty[ConversationID, List[(UserID, String)]])
           case _ =>
-          //context.log.info(s"********** SKIPPED **************")
         }
-        Await.ready(maybeHistory, 3.seconds)
+        Await.ready(maybeHistory, requestTimeout)
+        idle()
+      case DeleteConversation(conversationID, replyTo) =>
+        context.log.info(s"Deleting history of conversation ${conversationID}")
+        val maybeDeleted =
+          persistentEventSourcedActor.askWithStatus(DeleteConversation(conversationID, _))
+        maybeDeleted onComplete {
+          case Success(res) => replyTo ! StatusReply.Success(res)
+          case Failure(res) => replyTo ! StatusReply.error(res)
+        }
+        Await.ready(maybeDeleted, requestTimeout)
         idle()
 
       case NotifyClient(message) =>
@@ -190,7 +209,7 @@ private class ConversationBehavior(
         client ! message
         idle()
       case ConversationTimeout =>
-        session ! SessionTimeout(conversationID)
+        sessionHandler ! SessionTimeout(conversationID)
         // This will also stop the event sourced actor
         Behaviors.stopped
     }
